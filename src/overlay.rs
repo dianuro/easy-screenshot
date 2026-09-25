@@ -574,7 +574,10 @@ impl Overlay {
                 && self.surfaces.values().all(|c| c.configured)
                 && self.outputs_ready();
             if self.lock_due.is_none() && ready {
-                self.lock_due = Some(Instant::now() + Duration::from_millis(120));
+                // 只需要给合成器一点时间提交透明的全屏表面。原实现固定等待
+                // 120ms，在 KDE 上会明显拖慢每次启动；配置和首帧通常几十毫秒内
+                // 就已到达，50ms 足够避免抓到覆盖层本身。
+                self.lock_due = Some(Instant::now() + Duration::from_millis(50));
             }
             if let Some(due) = self.lock_due
                 && Instant::now() >= due
@@ -703,6 +706,10 @@ impl Overlay {
                 let cropped = portal::crop_rgba(&full.rgba, full.size, crop);
                 let background = resize_rgba_bilinear(&cropped, (crop.w, crop.h), ctx.size)?;
                 let blurred_background = gaussian_blur_rgba(&background, ctx.size.0, ctx.size.1);
+                // 生产绘制路径直接使用预先转换好的 ARGB。这样鼠标移动时只需
+                // 一次 memcpy + 选区局部复制，而不是每帧对整屏执行颜色转换。
+                let background = rgba_to_argb_image(&background);
+                let blurred_background = dimmed_rgba_to_argb_image(&blurred_background);
                 prepared.push((key.clone(), background, blurred_background));
             }
             Ok(prepared)
@@ -1111,8 +1118,8 @@ impl Overlay {
 
         let len = canvas.len().min((w as usize) * (h as usize) * 4);
         if let Some(background) = ctx.background.as_deref() {
-            let blurred = ctx.blurred_background.as_deref().unwrap_or(background);
-            paint_frozen(canvas, background, blurred, w, h, ctx.selection);
+            let dimmed = ctx.blurred_background.as_deref().unwrap_or(background);
+            paint_frozen_argb(canvas, background, dimmed, w, h, ctx.selection);
         } else {
             // 启动帧锁定前保持全透明。表面仍然映射并持有键盘焦点，
             // 但 Portal 看到的是底下未被覆盖的桌面。
@@ -1224,10 +1231,63 @@ fn gaussian_blur_rgba(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     blurred
 }
 
+/// 把整张 RGBA 图转换成 wl_shm 使用的 ARGB8888 内存布局。
+fn rgba_to_argb_image(src: &[u8]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(src.len());
+    for pixel in src.chunks_exact(4) {
+        dst.extend_from_slice(&rgba_to_argb([pixel[0], pixel[1], pixel[2], pixel[3]]));
+    }
+    dst
+}
+
+/// 生成可直接复制到 ARGB canvas 的暗化图像。
+fn dimmed_rgba_to_argb_image(src: &[u8]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(src.len());
+    for pixel in src.chunks_exact(4) {
+        dst.extend_from_slice(&rgba_to_argb(dim_pixel(pixel)));
+    }
+    dst
+}
+
+/// 把预先转换好的 ARGB 图像画成覆盖层。
+///
+/// 选区外的暗化图和选区内的清晰图都已提前完成颜色转换。鼠标移动时这里
+/// 只执行整图 memcpy 和选区局部 memcpy，避免每帧重复进行逐像素算术。
+fn paint_frozen_argb(
+    canvas: &mut [u8],
+    background: &[u8],
+    dimmed_background: &[u8],
+    w: u32,
+    h: u32,
+    selection: Option<Rect>,
+) {
+    let px = (w as usize) * (h as usize);
+    let len = px * 4;
+    if canvas.len() < len || background.len() < len || dimmed_background.len() < len {
+        return;
+    }
+
+    canvas[..len].copy_from_slice(&dimmed_background[..len]);
+
+    let Some(sel) = selection else { return };
+    let (ix0, iy0, ix1, iy1) = clipped_selection(sel, w, h);
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return;
+    }
+    let row_bytes = (ix1 - ix0) as usize * 4;
+    for y in iy0..iy1 {
+        let offset = (y as usize * w as usize + ix0 as usize) * 4;
+        canvas[offset..offset + row_bytes].copy_from_slice(&background[offset..offset + row_bytes]);
+    }
+    paint_border(canvas, w, h, sel);
+}
+
 /// 把冻结的 RGBA 桌面画成完全不透明的 ARGB8888 覆盖层。
 ///
 /// 选区外使用预计算的轻微高斯模糊 + 冷灰暗化，选区内保留清晰冻结像素；
 /// 最终裁剪仍从 Portal/KWin 的原始帧完成，不使用这里的视觉处理结果。
+/// 生产路径使用上面的 [`paint_frozen_argb`]，此函数保留给测试和纯 RGBA 调用方。
+#[cfg(test)]
 pub fn paint_frozen(
     canvas: &mut [u8],
     background: &[u8],
@@ -1282,6 +1342,7 @@ fn dim_pixel(src: &[u8]) -> [u8; 4] {
     out
 }
 
+#[cfg(test)]
 fn opaque_pixel(src: &[u8]) -> [u8; 4] {
     let alpha = src[3] as u16;
     let mut out = [0; 4];
