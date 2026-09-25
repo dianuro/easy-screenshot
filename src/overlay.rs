@@ -1,13 +1,13 @@
 //! Wayland 覆盖层：正常交互优先为每个输出创建一个真正的 xdg-shell fullscreen 窗口，
 //! 在没有 xdg-shell 时才回退到 `zwlr_layer_surface_v1`。
 //! 启动时先通过 Portal/KWin 锁定完整桌面帧，再用 `wl_shm` 把这份静态画面铺到所有输出，
-//! 叠加「框外轻微高斯模糊/冷灰暗化 + 2px 冷蓝边框」并接收鼠标拖拽与键盘。用户确认时只裁剪启动帧，不再抓屏。
+//! 叠加「框外冷灰暗化 + 2px 冷蓝边框」并接收鼠标拖拽与键盘。用户确认时只裁剪启动帧，不再抓屏。
 //!
 //! 关键实现约定（本机实测得出，改动前请先读 [`crate::geometry::plan_crop`] 的注释）：
 //! - 逻辑尺寸 = 1536×864，物理 1920×1080，分数缩放 1.25。`wl_output.scale` 会谎报成 2，
 //!   所以这里**只使用逻辑坐标**：surface-local 坐标 == buffer 像素坐标 == 逻辑坐标。
 //! - buffer 按逻辑尺寸 1:1 分配并 `set_buffer_scale(1)`，代价是被合成器放大 1.25 倍显示，
-//!   对「模糊/暗化 + 边框」完全够用（鼠标指针由合成器绘制，不受影响）。
+//!   对「暗化 + 边框」完全够用（鼠标指针由合成器绘制，不受影响）。
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
@@ -75,7 +75,7 @@ use crate::portal;
 /// 边框宽度（逻辑像素）。
 pub const BORDER_WIDTH: u32 = 2;
 /// 框外暗化程度。
-pub const DIM_ALPHA: u8 = 0x4D;
+pub const DIM_ALPHA: u8 = 0x66;
 /// 暗化的冷灰色调（R,G,B），避免给冻结画面叠加黄色调。
 const DIM_TINT: [u8; 3] = [10, 14, 20];
 
@@ -203,8 +203,8 @@ struct SurfaceCtx {
     pool_size: (u32, u32),
     /// 启动帧按本输出逻辑尺寸缩放后的清晰 RGBA 缓存；锁定前为 `None`。
     background: Option<Vec<u8>>,
-    /// 同一画面的轻微高斯模糊缓存，用于选区外。
-    blurred_background: Option<Vec<u8>>,
+    /// 同一画面的暗化缓存，用于选区外。
+    dimmed_background: Option<Vec<u8>>,
     /// 当前选区（surface-local 逻辑坐标）；松手后保留。
     selection: Option<Rect>,
     /// 拖拽起点；`Some` 表示正在拖拽。
@@ -528,7 +528,7 @@ fn create_surfaces(
                 pool: None,
                 pool_size: (0, 0),
                 background: None,
-                blurred_background: None,
+                dimmed_background: None,
                 selection: None,
                 drag_origin: None,
                 last_drawn: None,
@@ -659,7 +659,7 @@ impl Overlay {
                     ctx.first_frame = true;
                     ctx.pool = None;
                     ctx.background = None;
-                    ctx.blurred_background = None;
+                    ctx.dimmed_background = None;
                     ctx.presented = false;
                 }
                 ctx.configured = true;
@@ -737,20 +737,14 @@ impl Overlay {
                         resize_started.elapsed()
                     );
                 }
-                let blur_started = Instant::now();
-                let blurred_background = gaussian_blur_rgba(&background, ctx.size.0, ctx.size.1);
-                if self.opts.verbose {
-                    eprintln!(
-                        "[verbose] 背景模糊 {}: {:?}",
-                        ctx.name,
-                        blur_started.elapsed()
-                    );
-                }
-                // 生产绘制路径直接使用预先转换好的 ARGB。这样鼠标移动时只需
+                // 选区外只做冷灰暗化，不做高斯模糊，保留桌面文字和图标的清晰度。
+                // 生产绘制路径直接使用预先转换好的 ARGB，鼠标移动时只需
                 // 一次 memcpy + 选区局部复制，而不是每帧执行颜色转换。
                 let convert_started = Instant::now();
+                // 两个输出都从未转换的 RGBA 图像生成，避免把 ARGB 内存布局
+                // 误当作 RGBA 再做一次颜色转换。
+                let dimmed_background = dimmed_rgba_to_argb_image(&background);
                 let background = rgba_to_argb_image(&background);
-                let blurred_background = dimmed_rgba_to_argb_image(&blurred_background);
                 if self.opts.verbose {
                     eprintln!(
                         "[verbose] 背景转换 {}: {:?}",
@@ -758,7 +752,7 @@ impl Overlay {
                         convert_started.elapsed()
                     );
                 }
-                prepared.push((key.clone(), background, blurred_background));
+                prepared.push((key.clone(), background, dimmed_background));
             }
             Ok(prepared)
         })();
@@ -775,10 +769,10 @@ impl Overlay {
 
         self.frozen = Some(full);
         self.locked = true;
-        for (key, background, blurred_background) in prepared {
+        for (key, background, dimmed_background) in prepared {
             if let Some(ctx) = self.surfaces.get_mut(&key) {
                 ctx.background = Some(background);
-                ctx.blurred_background = Some(blurred_background);
+                ctx.dimmed_background = Some(dimmed_background);
                 ctx.first_frame = true;
             }
             self.redraw(qh, &key);
@@ -1216,7 +1210,7 @@ impl Overlay {
 
         let len = canvas.len().min((w as usize) * (h as usize) * 4);
         if let Some(background) = ctx.background.as_deref() {
-            let dimmed = ctx.blurred_background.as_deref().unwrap_or(background);
+            let dimmed = ctx.dimmed_background.as_deref().unwrap_or(background);
             paint_frozen_argb(canvas, background, dimmed, w, h, ctx.selection);
         } else {
             // 启动帧锁定前保持全透明。表面仍然映射并持有键盘焦点，
@@ -1305,47 +1299,6 @@ fn resize_rgba_bilinear(src: &[u8], src_size: (u32, u32), dst_size: (u32, u32)) 
     Ok(dst)
 }
 
-/// 3×3 binomial Gaussian blur（轻微、边缘钳制），只用于选择页面的预览层。
-fn gaussian_blur_rgba(src: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let len = (w as usize) * (h as usize) * 4;
-    if src.len() < len || w == 0 || h == 0 {
-        return src.to_vec();
-    }
-    let mut horizontal = vec![0u8; len];
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let left = &src[((y * w as usize) + x.saturating_sub(1)) * 4..][..4];
-            let center = &src[((y * w as usize) + x) * 4..][..4];
-            let right = &src[((y * w as usize) + (x + 1).min(w as usize - 1)) * 4..][..4];
-            let out = ((y * w as usize) + x) * 4;
-            for channel in 0..4 {
-                horizontal[out + channel] = ((left[channel] as u16
-                    + 2 * center[channel] as u16
-                    + right[channel] as u16
-                    + 2)
-                    / 4) as u8;
-            }
-        }
-    }
-
-    let mut blurred = vec![0u8; len];
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let top = y.saturating_sub(1);
-            let bottom = (y + 1).min(h as usize - 1);
-            let out = ((y * w as usize) + x) * 4;
-            for channel in 0..4 {
-                blurred[out + channel] = ((horizontal[(top * w as usize + x) * 4 + channel] as u16
-                    + 2 * horizontal[(y * w as usize + x) * 4 + channel] as u16
-                    + horizontal[(bottom * w as usize + x) * 4 + channel] as u16
-                    + 2)
-                    / 4) as u8;
-            }
-        }
-    }
-    blurred
-}
-
 /// 把整张 RGBA 图转换成 wl_shm 使用的 ARGB8888 内存布局。
 fn rgba_to_argb_image(src: &[u8]) -> Vec<u8> {
     let mut dst = Vec::with_capacity(src.len());
@@ -1399,26 +1352,26 @@ fn paint_frozen_argb(
 
 /// 把冻结的 RGBA 桌面画成完全不透明的 ARGB8888 覆盖层。
 ///
-/// 选区外使用预计算的轻微高斯模糊 + 冷灰暗化，选区内保留清晰冻结像素；
+/// 选区外使用预计算的冷灰暗化，选区内保留清晰冻结像素；
 /// 最终裁剪仍从 Portal/KWin 的原始帧完成，不使用这里的视觉处理结果。
 /// 生产路径使用上面的 [`paint_frozen_argb`]，此函数保留给测试和纯 RGBA 调用方。
 #[cfg(test)]
 pub fn paint_frozen(
     canvas: &mut [u8],
     background: &[u8],
-    blurred_background: &[u8],
+    dimmed_background: &[u8],
     w: u32,
     h: u32,
     selection: Option<Rect>,
 ) {
     let px = (w as usize) * (h as usize);
-    if canvas.len() < px * 4 || background.len() < px * 4 || blurred_background.len() < px * 4 {
+    if canvas.len() < px * 4 || background.len() < px * 4 || dimmed_background.len() < px * 4 {
         return;
     }
 
     for (dst, src) in canvas[..px * 4]
         .chunks_exact_mut(4)
-        .zip(blurred_background[..px * 4].chunks_exact(4))
+        .zip(dimmed_background[..px * 4].chunks_exact(4))
     {
         dst.copy_from_slice(&rgba_to_argb(dim_pixel(src)));
     }
@@ -1710,7 +1663,7 @@ impl LayerShellHandler for Overlay {
                 ctx.first_frame = true;
                 ctx.pool = None;
                 ctx.background = None;
-                ctx.blurred_background = None;
+                ctx.dimmed_background = None;
                 ctx.presented = false;
                 if self.opts.verbose {
                     eprintln!("[verbose] layer surface configure {}x{}", w, h);
@@ -1764,7 +1717,7 @@ impl WindowHandler for Overlay {
                 ctx.first_frame = true;
                 ctx.pool = None;
                 ctx.background = None;
-                ctx.blurred_background = None;
+                ctx.dimmed_background = None;
                 ctx.presented = false;
                 if self.opts.verbose {
                     eprintln!("[verbose] xdg fullscreen configure {}x{}", w, h);
@@ -2152,19 +2105,6 @@ mod tests {
         let src = [10u8, 20, 30, 255].repeat(4);
         let dst = resize_rgba_bilinear(&src, (2, 2), (4, 4)).unwrap();
         assert_eq!(dst, [10, 20, 30, 255].repeat(16));
-    }
-
-    #[test]
-    fn gaussian_blur_softens_a_bright_center() {
-        let (w, h) = (3u32, 3u32);
-        let mut src = vec![0u8; (w * h * 4) as usize];
-        let center = (w as usize + 1) * 4;
-        src[center..center + 4].copy_from_slice(&[255, 255, 255, 255]);
-        let blurred = gaussian_blur_rgba(&src, w, h);
-        let center = (w as usize + 1) * 4;
-        let neighbor = (w as usize) * 4;
-        assert!(blurred[center] < 255);
-        assert!(blurred[neighbor] > 0);
     }
 
     #[test]
