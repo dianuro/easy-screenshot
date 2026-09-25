@@ -2,5 +2,20 @@
 name = "easy-screenshot"
 version = "0.1.0"
 edition = "2024"
+description = "极简 Linux 截图工具：拖框选中，Ctrl+C 复制到剪贴板"
 
 [dependencies]
+# Wayland 客户端（含 layer-shell / shm / seat / calloop 集成）
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop", "xkbcommon"] }
+# XDG Desktop Portal 截图调用（D-Bus）
+zbus = "5"
+# PNG 解码（portal 返回的整屏图）与重新编码（裁剪结果）
+png = "0.17"
+# 错误上下文
+anyhow = "1"
+# SIGINT 自管道（让从终端按 Ctrl+C 与覆盖层里按 Ctrl+C 行为一致）
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true
