@@ -85,10 +85,6 @@ fn run() -> Result<ExitCode> {
         );
     }
 
-    if !cli.smoke {
-        portal::maybe_prompt_kwin_permission(cli.verbose)?;
-    }
-
     let created_after = SystemTime::now();
 
     let interactive = cli.rect.is_none();
@@ -358,8 +354,7 @@ easy-screenshot {version} —— 极简 Linux 截图工具
     --save <文件>      额外把裁剪结果写成一个 PNG 文件
     --no-clipboard     不复制到剪贴板（需配合 --save）
     --keep-file        保留 Portal 后端落在 ~/Pictures 的整屏 PNG（默认会删除）
-    --install-kwin-permission  显式安装 KDE KWin 静默抓屏授权条目
-                              （普通 KDE 运行缺少授权时会先询问）
+    --install-kwin-permission  安装 KDE KWin 静默抓屏授权条目
     --timeout <秒>     等待抓屏响应的超时，默认 60
     --verbose          打印调试信息（选区、缩放比、抓屏耗时）
     --smoke            只验证能否建立覆盖层，打印 configure 尺寸后退出

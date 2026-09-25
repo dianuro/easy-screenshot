@@ -1,0 +1,17 @@
+{
+  "nextId": 3,
+  "tasks": [
+    {
+      "id": "2",
+      "subject": "精简 README 并构建二进制",
+      "description": "将 README.md 精简为必要的构建、运行、参数、依赖和 KDE 授权说明；执行 cargo build --release，确认 target/release/easy-screenshot 生成且可运行。",
+      "status": "completed",
+      "activeForm": "精简文档并构建二进制",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1790328832942,
+      "updatedAt": 1790328886211
+    }
+  ]
+}

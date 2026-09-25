@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -106,16 +106,15 @@ fn is_kde_session() -> bool {
         .any(|desktop| desktop.eq_ignore_ascii_case("KDE"))
 }
 
-fn current_executable() -> Result<PathBuf> {
-    std::env::current_exe()
+/// 为当前可执行文件写入 KDE 的受限 D-Bus 授权条目。
+///
+/// 这是一个显式的用户操作：它允许该二进制无确认地调用 KWin ScreenShot2。
+/// 普通运行不会自动授予这项权限；未安装时仍安全回退到 Portal。
+pub fn install_kwin_permission() -> Result<PathBuf> {
+    let executable = std::env::current_exe()
         .context("获取当前程序路径失败")?
         .canonicalize()
-        .context("解析当前程序真实路径失败")
-}
-
-/// 返回当前二进制对应的 KDE 授权文件路径和完整内容。
-fn kwin_permission_data() -> Result<(PathBuf, String)> {
-    let executable = current_executable()?;
+        .context("解析当前程序真实路径失败")?;
     let executable = executable
         .to_str()
         .context("当前程序路径不是 UTF-8，无法写入桌面授权条目")?;
@@ -124,9 +123,10 @@ fn kwin_permission_data() -> Result<(PathBuf, String)> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
         .context("找不到 XDG_DATA_HOME 或 HOME，无法安装 KDE 授权条目")?;
-    let path = data_home
-        .join("applications")
-        .join("easy-screenshot.desktop");
+    let applications = data_home.join("applications");
+    std::fs::create_dir_all(&applications)
+        .with_context(|| format!("创建 {} 失败", applications.display()))?;
+    let path = applications.join("easy-screenshot.desktop");
     let contents = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -136,148 +136,7 @@ fn kwin_permission_data() -> Result<(PathBuf, String)> {
          NoDisplay=true\n\
          X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\n"
     );
-    Ok((path, contents))
-}
-
-/// 判断当前二进制是否已经有匹配的 KDE 授权条目。
-fn kwin_permission_is_current() -> bool {
-    let Ok((path, expected)) = kwin_permission_data() else {
-        return false;
-    };
-    std::fs::read_to_string(path).is_ok_and(|contents| contents == expected)
-}
-
-/// 返回“用户已拒绝为当前二进制授权”的状态文件路径和内容。
-fn kwin_decline_marker_data() -> Result<(PathBuf, String)> {
-    let executable = current_executable()?;
-    let executable = executable
-        .to_str()
-        .context("当前程序路径不是 UTF-8，无法记录 KDE 授权选择")?;
-    let state_home = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .context("找不到 XDG_STATE_HOME 或 HOME，无法记录 KDE 授权选择")?;
-    Ok((
-        state_home
-            .join("easy-screenshot")
-            .join("kwin-permission-declined"),
-        format!("{executable}\n"),
-    ))
-}
-
-fn kwin_permission_declined() -> bool {
-    let Ok((path, expected)) = kwin_decline_marker_data() else {
-        return false;
-    };
-    std::fs::read_to_string(path).is_ok_and(|contents| contents == expected)
-}
-
-fn remember_kwin_permission_declined(verbose: bool) {
-    let Ok((path, contents)) = kwin_decline_marker_data() else {
-        return;
-    };
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let result = std::fs::create_dir_all(parent).and_then(|_| std::fs::write(&path, contents));
-    if let Err(e) = result
-        && verbose
-    {
-        eprintln!(
-            "[verbose] 无法记录 KDE 授权选择（下次仍可能再次询问）：{}: {e}",
-            path.display()
-        );
-    }
-}
-
-fn forget_kwin_permission_declined() {
-    if let Ok((path, _)) = kwin_decline_marker_data() {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// KDE 安装桌面数据库后，让刚写入的 Exec= 授权条目立即可见。
-///
-/// 这是一个 best-effort 刷新；没有 kbuildsycoca6 的环境仍可稍后重试或显式安装。
-fn refresh_kwin_desktop_cache() {
-    let _ = std::process::Command::new("kbuildsycoca6")
-        .arg("--noincremental")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-/// 首次检测到当前二进制没有 KDE 静默抓屏授权时，询问用户是否写入授权条目。
-///
-/// 只有 KDE 会话、交互式终端且没有强制 Portal 时才会询问；拒绝不会阻止截图，
-/// 程序会继续走 XDG Portal 后备路径，并记住当前二进制的拒绝选择。
-pub fn maybe_prompt_kwin_permission(verbose: bool) -> Result<()> {
-    if !is_kde_session() || std::env::var_os("EASY_SCREENSHOT_FORCE_PORTAL").is_some() {
-        return Ok(());
-    }
-    if kwin_permission_is_current() {
-        forget_kwin_permission_declined();
-        return Ok(());
-    }
-    if kwin_permission_declined() {
-        return Ok(());
-    }
-
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        if verbose {
-            eprintln!(
-                "[verbose] 未检测到当前二进制的 KWin 授权，且当前不是交互式终端；\
-                 将直接尝试 KWin/Portal 后备路径"
-            );
-        }
-        return Ok(());
-    }
-
-    let Ok((path, _)) = kwin_permission_data() else {
-        if verbose {
-            eprintln!("[verbose] 无法确定 KDE 授权文件路径；将直接尝试 KWin/Portal 后备路径");
-        }
-        return Ok(());
-    };
-    println!("检测到 KDE 静默抓屏尚未授权。");
-    println!("是否允许写入用户级授权条目：{}", path.display());
-    println!("这会允许当前二进制无确认调用 KWin ScreenShot2；拒绝则使用 Portal 后备。");
-    print!("继续吗？[y/N] ");
-    io::stdout().flush().context("输出 KDE 授权提示失败")?;
-
-    let mut answer = String::new();
-    let read = io::stdin()
-        .read_line(&mut answer)
-        .context("读取 KDE 授权选择失败")?;
-    if read == 0 {
-        println!();
-        remember_kwin_permission_declined(verbose);
-        println!("未收到选择，将使用 Portal 后备路径；下次运行不会重复询问。");
-        return Ok(());
-    }
-
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        let path = install_kwin_permission()?;
-        println!("已安装 KDE KWin 静默抓屏授权：{}", path.display());
-    } else {
-        remember_kwin_permission_declined(verbose);
-        println!("已跳过授权，将使用 Portal 后备路径；下次运行不会重复询问。");
-    }
-    Ok(())
-}
-
-/// 为当前可执行文件写入 KDE 的受限 D-Bus 授权条目。
-///
-/// 这是一个显式的用户操作：它允许该二进制无确认地调用 KWin ScreenShot2。
-/// 普通运行不会静默授予这项权限；用户拒绝提示或未安装时仍安全回退到 Portal。
-pub fn install_kwin_permission() -> Result<PathBuf> {
-    let (path, contents) = kwin_permission_data()?;
-    let applications = path.parent().context("KDE 授权文件没有有效的父目录")?;
-    std::fs::create_dir_all(applications)
-        .with_context(|| format!("创建 {} 失败", applications.display()))?;
     std::fs::write(&path, contents).with_context(|| format!("写入 {} 失败", path.display()))?;
-    forget_kwin_permission_declined();
-    refresh_kwin_desktop_cache();
     Ok(path)
 }
 

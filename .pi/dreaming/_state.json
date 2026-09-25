@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "settings": {
+    "enabled": true,
+    "intervalMs": 300000,
+    "minCharsForDream": 1000,
+    "maxDigestChars": 24000,
+    "maxActiveMemoriesInPrompt": 30,
+    "autoSaveMinConfidence": 0.72
+  },
+  "lastRun": {
+    "startedAt": "2026-09-25T09:34:49.999Z",
+    "reason": "agent_end",
+    "status": "completed",
+    "finishedAt": "2026-09-25T09:35:13.243Z",
+    "signature": "0f228cdaca7f0585b1838ca9",
+    "message": "dreaming completed"
+  }
+}
