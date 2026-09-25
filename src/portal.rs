@@ -21,6 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -124,11 +125,37 @@ fn is_kde_session() -> bool {
 /// 只有内容已经匹配时才写入，移动或重新编译二进制后会自动更新 `Exec`。
 pub fn ensure_kwin_permission() -> Result<PathBuf> {
     let (path, contents) = kwin_permission_file()?;
-    if std::fs::read_to_string(&path).ok().as_deref() == Some(contents.as_str()) {
-        return Ok(path);
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(contents.as_str()) {
+        std::fs::write(&path, contents).with_context(|| format!("写入 {} 失败", path.display()))?;
     }
-    std::fs::write(&path, contents).with_context(|| format!("写入 {} 失败", path.display()))?;
+    // KWin 的 KApplicationTrader 可能在进程内缓存应用列表；即使文件内容没变，
+    // 也要刷新一次，确保新增的桌面文件能被当前 KWin 进程看到。
+    refresh_kde_service_cache();
     Ok(path)
+}
+
+/// KWin 通过 KApplicationTrader 的缓存查找 `.desktop` 授权条目。
+/// 写入文件后必须刷新缓存，否则本次进程仍可能看到旧的服务列表并回退 Portal。
+fn refresh_kde_service_cache() {
+    match Command::new("kbuildsycoca6")
+        .arg("--noincremental")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            // kbuildsycoca6 通知 KDE 服务更新缓存后，短暂等待缓存切换完成。
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(status) => {
+            eprintln!(
+                "[verbose] 刷新 KDE 应用缓存失败（退出状态 {status}），KWin 静默抓屏可能不可用"
+            );
+        }
+        Err(e) => {
+            eprintln!("[verbose] 找不到 kbuildsycoca6，KWin 静默抓屏可能不可用：{e}");
+        }
+    }
 }
 
 /// 显式安装 KDE 授权条目；正常 KDE 启动会自动调用同样的逻辑。
