@@ -9,6 +9,7 @@
 - 框外模糊、暗化，框内保持清晰
 - 支持 Ctrl+C / Enter 复制，Ctrl+S 保存，Esc / 右键取消
 - 支持 KWin 原生抓屏；不可用时自动回退到 XDG Desktop Portal
+- KDE 首次运行自动准备 KWin 静默抓屏授权，无需额外命令
 - 支持分数缩放和多显示器
 
 ## 构建
@@ -74,7 +75,7 @@ save_dir = /path/to/pictures
 
 ## KDE 静默抓屏
 
-KDE 下建议先授权 KWin 原生抓屏接口，启动更快，也不会短暂显示 Portal 截图窗口：
+KDE 下首次运行会自动创建 KWin 原生抓屏所需的桌面授权条目，之后启动更快，也不会短暂显示 Portal 截图窗口。可显式执行以下命令预先生成或更新授权条目：
 
 ```bash
 ./target/release/easy-screenshot --install-kwin-permission
@@ -92,7 +93,7 @@ KDE 下建议先授权 KWin 原生抓屏接口，启动更快，也不会短暂�
 ~/.local/share/applications/easy-screenshot.desktop
 ```
 
-如果移动或重新编译了二进制文件，需要重新执行授权命令。未授权时程序会自动回退到 XDG Portal。
+如果移动或重新编译了二进制文件，下次启动会自动更新授权条目。自动授权失败时程序会回退到 XDG Portal。
 
 ## 依赖
 
@@ -117,7 +118,7 @@ easy-screenshot --save screenshot.png --no-clipboard
 
 ### 启动时仍然较慢
 
-先确认已执行 `--install-kwin-permission`。没有授权时，程序必须通过 Portal 抓屏，速度会明显慢一些。
+程序会在 KDE 首次抓屏前自动准备授权。如果自动授权失败或不在 KDE 环境，会回退到 Portal，抓屏速度会明显慢一些。
 
 可用 `--verbose` 查看具体耗时：
 

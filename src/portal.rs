@@ -87,6 +87,18 @@ pub struct CroppedShot {
 pub fn capture_full(timeout: Duration, verbose: bool) -> Result<FullShot> {
     let force_portal = std::env::var_os("EASY_SCREENSHOT_FORCE_PORTAL").is_some();
     if !force_portal && is_kde_session() {
+        match ensure_kwin_permission() {
+            Ok(path) => {
+                if verbose {
+                    eprintln!("[verbose] KDE 静默抓屏授权已就绪：{}", path.display());
+                }
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("[verbose] 自动准备 KDE 静默抓屏授权失败，继续尝试 Portal：{e:#}");
+                }
+            }
+        }
         match capture_kwin_full(timeout, verbose) {
             Ok(shot) => return Ok(shot),
             Err(e) => {
@@ -106,11 +118,25 @@ fn is_kde_session() -> bool {
         .any(|desktop| desktop.eq_ignore_ascii_case("KDE"))
 }
 
-/// 为当前可执行文件写入 KDE 的受限 D-Bus 授权条目。
+/// 确保当前可执行文件拥有 KDE 的受限 D-Bus 授权条目。
 ///
-/// 这是一个显式的用户操作：它允许该二进制无确认地调用 KWin ScreenShot2。
-/// 普通运行不会自动授予这项权限；未安装时仍安全回退到 Portal。
+/// KDE 首次抓屏前会自动创建/更新该文件，因此不需要用户额外执行命令。
+/// 只有内容已经匹配时才写入，移动或重新编译二进制后会自动更新 `Exec`。
+pub fn ensure_kwin_permission() -> Result<PathBuf> {
+    let (path, contents) = kwin_permission_file()?;
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(contents.as_str()) {
+        return Ok(path);
+    }
+    std::fs::write(&path, contents).with_context(|| format!("写入 {} 失败", path.display()))?;
+    Ok(path)
+}
+
+/// 显式安装 KDE 授权条目；正常 KDE 启动会自动调用同样的逻辑。
 pub fn install_kwin_permission() -> Result<PathBuf> {
+    ensure_kwin_permission()
+}
+
+fn kwin_permission_file() -> Result<(PathBuf, String)> {
     let executable = std::env::current_exe()
         .context("获取当前程序路径失败")?
         .canonicalize()
@@ -136,8 +162,7 @@ pub fn install_kwin_permission() -> Result<PathBuf> {
          NoDisplay=true\n\
          X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\n"
     );
-    std::fs::write(&path, contents).with_context(|| format!("写入 {} 失败", path.display()))?;
-    Ok(path)
+    Ok((path, contents))
 }
 
 /// KDE 的原生 ScreenShot2 接口：直接接收 KWin 的原始像素，不创建 Portal UI。
