@@ -1,7 +1,8 @@
 //! easy-screenshot —— 极简 Linux 截图工具。
 //!
 //! 用法：运行 → 全屏锁定启动画面 → 鼠标拖框 → 松手后框线留在屏幕上 →
-//! `Ctrl+C` 把启动帧的框内区域放进剪贴板并退出。
+//! `Ctrl+C` 把启动帧的框内区域放进剪贴板并退出；`Ctrl+S` 按内容哈希把选区
+//! 保存成 PNG（目录可在配置文件中自定义）并退出。
 //!
 //! 架构（每块都在对应模块的文件头里有更详细的「为什么」）：
 //! - [`overlay`]：Wayland xdg-shell fullscreen 覆盖层（不可用时回退 layer-shell）+ shm 绘制 + 指针/键盘交互；
@@ -10,13 +11,17 @@
 //!   `wlr-screencopy` 与 X11 抓屏都不可用，使用 KWin 直连或 Portal 后备）；
 //! - [`clipboard`]：调 `wl-copy` 把 PNG 放进系统剪贴板；
 //! - [`keys`]：按键语义判定 + SIGINT 自管道；
+//! - [`config`]：配置文件解析（Ctrl+S 的保存目录）；
+//! - [`save`]：按 PNG 内容哈希命名并写盘；
 //! - [`geometry`]：纯几何/路径工具，全部可单测。
 
 mod clipboard;
+mod config;
 mod geometry;
 mod keys;
 mod overlay;
 mod portal;
+mod save;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -115,6 +120,21 @@ fn run() -> Result<ExitCode> {
 
     let copy = match outcome {
         overlay::Outcome::Copy(c) => c,
+        overlay::Outcome::Saved(saved) => {
+            if cli.verbose {
+                eprintln!(
+                    "[verbose] Ctrl+S 保存：选区 {}x{}+{}+{}（全局逻辑，输出 {}），已写入 {}",
+                    saved.result.rect_global.w,
+                    saved.result.rect_global.h,
+                    saved.result.rect_global.x,
+                    saved.result.rect_global.y,
+                    saved.result.output_name,
+                    saved.path.display()
+                );
+            }
+            println!("已保存截图到 {}", saved.path.display());
+            return Ok(ExitCode::from(EXIT_OK));
+        }
         overlay::Outcome::Cancel => {
             eprintln!("已取消，剪贴板未改动。");
             return Ok(ExitCode::from(EXIT_CANCELLED));
@@ -348,7 +368,13 @@ easy-screenshot {version} —— 极简 Linux 截图工具
     3. 按住鼠标左键拖出一个框；
     4. 松开左键，框线留在冻结画面上（此时还没裁剪）；
     5. 按 Ctrl+C（或 Enter）从启动帧裁剪并放进系统剪贴板，然后退出；
+       按 Ctrl+S 把当前选区保存为 PNG（文件名 = 图片哈希）并退出；
        按 Esc 或点右键取消，退出码 1。
+
+    按 Ctrl+S 时保存目录：
+       默认 $XDG_PICTURES_DIR（或 ~/Pictures），可在配置文件里用 save_dir 覆盖：
+       $XDG_CONFIG_HOME/easy-screenshot/config（默认 ~/.config/easy-screenshot/config）
+       例如：save_dir = /path/to/dir
 
 选项：
     --save <文件>      额外把裁剪结果写成一个 PNG 文件

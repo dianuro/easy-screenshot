@@ -7,7 +7,7 @@
 - 启动时锁定完整桌面，选区期间画面不会变化
 - 冻结画面铺满所有显示器
 - 框外模糊、暗化，框内保持清晰
-- 支持 Ctrl+C / Enter 复制，Esc / 右键取消
+- 支持 Ctrl+C / Enter 复制，Ctrl+S 保存，Esc / 右键取消
 - 支持 KWin 原生抓屏；不可用时自动回退到 XDG Desktop Portal
 - 支持分数缩放和多显示器
 
@@ -43,9 +43,23 @@ cargo test
 2. 按住鼠标左键拖动选择区域
 3. 松开后可继续调整选区
 4. 按 `Ctrl+C` 或 `Enter` 复制到剪贴板
-5. 按 `Esc` 或鼠标右键取消
+5. 按 `Ctrl+S` 把当前选区保存为 PNG（文件名 = 图片哈希）并退出
+6. 按 `Esc` 或鼠标右键取消
 
 截图来源是程序启动时捕获的完整桌面帧，确认时不会再次抓屏。
+
+### Ctrl+S 保存目录
+
+默认保存到 `$XDG_PICTURES_DIR`（通常是 `~/Pictures`），文件名是图片内容的 SHA-256 哈希，格式 PNG。
+
+可在配置文件里自定义目录：
+
+```text
+# ~/.config/easy-screenshot/config（或 $XDG_CONFIG_HOME/easy-screenshot/config）
+save_dir = /path/to/pictures
+```
+
+`#` 开头是注释，值可以用引号包裹，`~/` 会展开成 HOME。
 
 ## 常用选项
 
@@ -143,6 +157,8 @@ cargo build --release
 | `src/portal.rs` | KWin / Portal 抓屏和 PNG 处理 |
 | `src/clipboard.rs` | `wl-copy` 调用 |
 | `src/keys.rs` | 键盘和信号处理 |
+| `src/config.rs` | 配置文件（保存目录）解析 |
+| `src/save.rs` | 按哈希命名保存 PNG |
 
 ## 退出码
 

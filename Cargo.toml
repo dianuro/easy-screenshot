@@ -13,6 +13,8 @@ zbus = "5"
 png = "0.17"
 # 错误上下文
 anyhow = "1"
+# Ctrl+S 保存文件时按 PNG 内容哈希命名
+sha2 = "0.10"
 # SIGINT 自管道（让从终端按 Ctrl+C 与覆盖层里按 Ctrl+C 行为一致）
 libc = "0.2"
 

@@ -14,6 +14,8 @@ use smithay_client_toolkit::seat::keyboard::Modifiers;
 /// Linux evdev/xkb keysym 原始值（见 `xkeysym`）。用原始值比较，避免猜常量名。
 const KEYSYM_C_LOWER: u32 = 0x0063; // XK_c
 const KEYSYM_C_UPPER: u32 = 0x0043; // XK_C
+const KEYSYM_S_LOWER: u32 = 0x0073; // XK_s
+const KEYSYM_S_UPPER: u32 = 0x0053; // XK_S
 const KEYSYM_ESCAPE: u32 = 0xff1b; // XK_Escape
 const KEYSYM_RETURN: u32 = 0xff0d; // XK_Return
 const KEYSYM_KP_ENTER: u32 = 0xff8d; // XK_KP_Enter
@@ -23,6 +25,8 @@ const KEYSYM_KP_ENTER: u32 = 0xff8d; // XK_KP_Enter
 pub enum Action {
     /// 把当前选区复制到剪贴板并退出。
     Copy,
+    /// 把当前选区按内容哈希保存为 PNG，并退出。
+    Save,
     /// 放弃本次截图。
     Cancel,
 }
@@ -33,6 +37,8 @@ pub fn action_for(keysym_raw: u32, modifiers: &Modifiers) -> Option<Action> {
         KEYSYM_ESCAPE => Some(Action::Cancel),
         // Ctrl+C（大小写都认，Ctrl+Shift+C 也顺带支持）
         KEYSYM_C_LOWER | KEYSYM_C_UPPER if modifiers.ctrl => Some(Action::Copy),
+        // Ctrl+S（大小写都认）：保存到目录并退出
+        KEYSYM_S_LOWER | KEYSYM_S_UPPER if modifiers.ctrl => Some(Action::Save),
         // Enter 作为 Ctrl+C 的等价键：某些环境里 Ctrl+C 更容易被别的程序抢走
         KEYSYM_RETURN | KEYSYM_KP_ENTER => Some(Action::Copy),
         _ => None,
@@ -121,6 +127,13 @@ mod tests {
     #[test]
     fn bare_c_does_nothing() {
         assert_eq!(action_for(KEYSYM_C_LOWER, &mods(false)), None);
+    }
+
+    #[test]
+    fn ctrl_s_saves() {
+        assert_eq!(action_for(KEYSYM_S_LOWER, &mods(true)), Some(Action::Save));
+        assert_eq!(action_for(KEYSYM_S_UPPER, &mods(true)), Some(Action::Save));
+        assert_eq!(action_for(KEYSYM_S_LOWER, &mods(false)), None);
     }
 
     #[test]

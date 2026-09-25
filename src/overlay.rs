@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -111,10 +112,18 @@ pub struct OverlayResult {
 pub enum Outcome {
     /// 用户确认，给出选区（以及交互模式下已经完成的截图 / 剪贴板状态）。
     Copy(Box<CopyOutcome>),
+    /// 用户按 Ctrl+S：已按内容哈希保存成 PNG，程序可以结束。
+    Saved(SavedOutcome),
     /// 用户取消（Esc / 右键 / 表面被关闭）。
     Cancel,
     /// `--smoke`：只验证能建起覆盖层，不做交互。
     Smoke(Vec<SmokeLine>),
+}
+
+/// Ctrl+S 保存成功后的结果。
+pub struct SavedOutcome {
+    pub result: OverlayResult,
+    pub path: PathBuf,
 }
 
 /// 交互模式下的完整结果。
@@ -1002,31 +1011,14 @@ impl Overlay {
         self.finish();
     }
 
-    /// 处理「复制」请求（Ctrl+C / Enter / SIGINT）。
-    fn request_copy(&mut self, qh: &QueueHandle<Self>, why: &str) {
-        if self.finished || self.pending.is_some() || !self.locked {
-            return;
-        }
-        let Some(active) = self.active.clone() else {
-            if self.opts.verbose {
-                eprintln!("[verbose] 收到 {why}，但还没有框选任何区域");
-            }
-            return;
+    /// 当前选区的全局逻辑矩形、所在输出矩形、工作区并集与输出名。
+    /// 没有有效选区时返回 `None`。
+    fn current_selection(&self) -> Option<(Rect, Rect, Rect, String)> {
+        let active = self.active.clone()?;
+        let (selection, output, name) = {
+            let ctx = self.surfaces.get(&active)?;
+            (ctx.selection?, ctx.output.clone(), ctx.name.clone())
         };
-        let Some((selection, output, name)) = self
-            .surfaces
-            .get(&active)
-            .map(|c| (c.selection, c.output.clone(), c.name.clone()))
-        else {
-            return;
-        };
-        let Some(selection) = selection else {
-            if self.opts.verbose {
-                eprintln!("[verbose] 收到 {why}，但当前没有有效选区（框太小？）");
-            }
-            return;
-        };
-
         let info = self.output_state.info(&output);
         let origin = info
             .as_ref()
@@ -1049,7 +1041,20 @@ impl Overlay {
             selection.h,
         );
         let workspace = workspace_union(&self.output_rects()).unwrap_or(output_rect);
+        Some((rect_global, output_rect, workspace, name))
+    }
 
+    /// 处理「复制」请求（Ctrl+C / Enter / SIGINT）。
+    fn request_copy(&mut self, qh: &QueueHandle<Self>, why: &str) {
+        if self.finished || self.pending.is_some() || !self.locked {
+            return;
+        }
+        let Some((rect_global, output_rect, workspace, name)) = self.current_selection() else {
+            if self.opts.verbose {
+                eprintln!("[verbose] 收到 {why}，但没有有效选区");
+            }
+            return;
+        };
         if self.opts.verbose {
             eprintln!(
                 "[verbose] {why}: 选区 {}x{}+{}+{}（全局逻辑坐标），输出 {name}",
@@ -1074,6 +1079,59 @@ impl Overlay {
 
         // 直接从启动时锁定的完整帧裁剪；不会隐藏覆盖层，也不会再次访问屏幕。
         self.run_capture(qh);
+    }
+
+    /// 处理「保存」请求（Ctrl+S）：把当前选区裁剪成 PNG，按内容哈希命名保存，
+    /// 成功后结束程序。失败则保持覆盖层，允许重试或改按 Ctrl+C。
+    fn request_save(&mut self, _qh: &QueueHandle<Self>) {
+        if self.finished || !self.locked {
+            return;
+        }
+        let Some((rect_global, output_rect, workspace, name)) = self.current_selection() else {
+            if self.opts.verbose {
+                eprintln!("[verbose] 收到 Ctrl+S，但没有有效选区");
+            }
+            return;
+        };
+        let Some(frozen) = self.frozen.as_ref() else {
+            if self.opts.verbose {
+                eprintln!("[verbose] 收到 Ctrl+S，但启动画面已不可用");
+            }
+            return;
+        };
+        let shot = match portal::crop_full(
+            frozen,
+            rect_global,
+            &[workspace, output_rect],
+            self.opts.verbose,
+        ) {
+            Ok(shot) => shot,
+            Err(e) => {
+                eprintln!("保存截图失败：{e:#}");
+                return;
+            }
+        };
+        if self.opts.verbose {
+            eprintln!(
+                "[verbose] Ctrl+S: 选区 {}x{}+{}+{}（全局逻辑坐标），输出 {name}",
+                rect_global.w, rect_global.h, rect_global.x, rect_global.y
+            );
+        }
+        match crate::save::save_png(&shot.png) {
+            Ok(path) => {
+                self.outcome = Some(Outcome::Saved(SavedOutcome {
+                    result: OverlayResult {
+                        rect_global,
+                        output_rect,
+                        workspace,
+                        output_name: name,
+                    },
+                    path,
+                }));
+                self.finished = true;
+            }
+            Err(e) => eprintln!("保存截图失败：{e:#}"),
+        }
     }
 
     /// 请求重绘某个表面。
@@ -1762,6 +1820,7 @@ impl KeyboardHandler for Overlay {
         }
         match keys::action_for(event.keysym.raw(), &self.modifiers) {
             Some(keys::Action::Copy) => self.request_copy(qh, "Ctrl+C/Enter"),
+            Some(keys::Action::Save) => self.request_save(qh),
             Some(keys::Action::Cancel) if !self.finished => {
                 self.outcome = Some(Outcome::Cancel);
                 self.finished = true;
