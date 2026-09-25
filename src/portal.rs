@@ -127,10 +127,10 @@ pub fn ensure_kwin_permission() -> Result<PathBuf> {
     let (path, contents) = kwin_permission_file()?;
     if std::fs::read_to_string(&path).ok().as_deref() != Some(contents.as_str()) {
         std::fs::write(&path, contents).with_context(|| format!("写入 {} 失败", path.display()))?;
+        // KWin 的 KApplicationTrader 可能在进程内缓存应用列表；只有文件内容
+        // 变化时才刷新，正常启动不承担 kbuildsycoca6 的约百毫秒开销。
+        refresh_kde_service_cache();
     }
-    // KWin 的 KApplicationTrader 可能在进程内缓存应用列表；即使文件内容没变，
-    // 也要刷新一次，确保新增的桌面文件能被当前 KWin 进程看到。
-    refresh_kde_service_cache();
     Ok(path)
 }
 
@@ -187,7 +187,8 @@ fn kwin_permission_file() -> Result<(PathBuf, String)> {
          Exec=\"{escaped}\"\n\
          Terminal=false\n\
          NoDisplay=true\n\
-         X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\n"
+         X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\n\
+         X-Easy-Screenshot-Cache-Version=2\n"
     );
     Ok((path, contents))
 }
@@ -314,7 +315,9 @@ fn wait_for_file_size(
                 timeout.as_secs()
             );
         }
-        std::thread::sleep(Duration::from_millis(20).min(timeout - elapsed));
+        // KWin 通常在 D-Bus 调用返回后很快写入临时文件；2ms 轮询比 20ms
+        // 少等待一个合成/文件系统调度周期，同时仍远低于用户可感知阈值。
+        std::thread::sleep(Duration::from_millis(2).min(timeout - elapsed));
     }
 }
 

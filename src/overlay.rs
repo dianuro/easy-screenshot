@@ -212,6 +212,8 @@ struct SurfaceCtx {
     /// 上一次重绘时用来算 damage 的选区。
     last_drawn: Option<Rect>,
     first_frame: bool,
+    /// 合成器已经确认透明首帧提交。
+    presented: bool,
     configured: bool,
 }
 
@@ -270,6 +272,7 @@ struct Overlay {
 
 /// 跑一次覆盖层交互。
 pub fn run(opts: Options) -> Result<Outcome> {
+    let started = Instant::now();
     let conn = Connection::connect_to_env()
         .context("连接 Wayland 失败：请确认在 Wayland 会话中运行，且 WAYLAND_DISPLAY 正确")?;
     let (globals, event_queue) =
@@ -337,6 +340,10 @@ pub fn run(opts: Options) -> Result<Outcome> {
     } else {
         None
     };
+    if opts.verbose {
+        eprintln!("[verbose] Wayland 初始化完成：{:?}", started.elapsed());
+    }
+
     let mut state = Overlay {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -526,6 +533,7 @@ fn create_surfaces(
                 drag_origin: None,
                 last_drawn: None,
                 first_frame: true,
+                presented: false,
                 configured: false,
             },
         );
@@ -582,15 +590,14 @@ impl Overlay {
             let ready = !self.surfaces.is_empty()
                 && self.surfaces.values().all(|c| c.configured)
                 && self.outputs_ready();
+            // 透明表面已经 configure 后请求 frame callback；收到回调即可安全
+            // 抓取启动帧，不再固定等待 50ms。保留 100ms 作为异常 compositor 的兜底。
             if self.lock_due.is_none() && ready {
-                // 只需要给合成器一点时间提交透明的全屏表面。原实现固定等待
-                // 120ms，在 KDE 上会明显拖慢每次启动；配置和首帧通常几十毫秒内
-                // 就已到达，50ms 足够避免抓到覆盖层本身。
-                self.lock_due = Some(Instant::now() + Duration::from_millis(50));
+                self.lock_due = Some(Instant::now() + Duration::from_millis(100));
             }
-            if let Some(due) = self.lock_due
-                && Instant::now() >= due
-            {
+            let presented =
+                !self.surfaces.is_empty() && self.surfaces.values().all(|c| c.presented);
+            if presented || self.lock_due.is_some_and(|due| Instant::now() >= due) {
                 self.lock_due = None;
                 self.lock_desktop(qh);
             }
@@ -653,6 +660,7 @@ impl Overlay {
                     ctx.pool = None;
                     ctx.background = None;
                     ctx.blurred_background = None;
+                    ctx.presented = false;
                 }
                 ctx.configured = true;
             }
@@ -671,6 +679,7 @@ impl Overlay {
         if self.frozen.is_some() || self.locked {
             return;
         }
+        let started = Instant::now();
         if self.opts.verbose {
             eprintln!("[verbose] 正在锁定启动画面…");
         }
@@ -684,6 +693,12 @@ impl Overlay {
             }
         };
 
+        if self.opts.verbose {
+            eprintln!(
+                "[verbose] 启动帧采集完成，开始准备覆盖层背景：{:?}",
+                started.elapsed()
+            );
+        }
         let prepared = (|| -> Result<Vec<PreparedBackground>> {
             let Some(workspace) = workspace_union(&self.output_rects()) else {
                 bail!("锁定启动画面时找不到任何有效输出");
@@ -712,13 +727,37 @@ impl Overlay {
                             ctx.name, full.size.0, full.size.1
                         )
                     })?;
+                let resize_started = Instant::now();
                 let cropped = portal::crop_rgba(&full.rgba, full.size, crop);
                 let background = resize_rgba_bilinear(&cropped, (crop.w, crop.h), ctx.size)?;
+                if self.opts.verbose {
+                    eprintln!(
+                        "[verbose] 背景裁剪缩放 {}: {:?}",
+                        ctx.name,
+                        resize_started.elapsed()
+                    );
+                }
+                let blur_started = Instant::now();
                 let blurred_background = gaussian_blur_rgba(&background, ctx.size.0, ctx.size.1);
+                if self.opts.verbose {
+                    eprintln!(
+                        "[verbose] 背景模糊 {}: {:?}",
+                        ctx.name,
+                        blur_started.elapsed()
+                    );
+                }
                 // 生产绘制路径直接使用预先转换好的 ARGB。这样鼠标移动时只需
-                // 一次 memcpy + 选区局部复制，而不是每帧对整屏执行颜色转换。
+                // 一次 memcpy + 选区局部复制，而不是每帧执行颜色转换。
+                let convert_started = Instant::now();
                 let background = rgba_to_argb_image(&background);
                 let blurred_background = dimmed_rgba_to_argb_image(&blurred_background);
+                if self.opts.verbose {
+                    eprintln!(
+                        "[verbose] 背景转换 {}: {:?}",
+                        ctx.name,
+                        convert_started.elapsed()
+                    );
+                }
                 prepared.push((key.clone(), background, blurred_background));
             }
             Ok(prepared)
@@ -747,8 +786,9 @@ impl Overlay {
 
         if self.opts.verbose {
             eprintln!(
-                "[verbose] 启动画面已锁定并映射到 {} 个全屏输出",
-                self.surfaces.len()
+                "[verbose] 启动画面已锁定并映射到 {} 个全屏输出，总耗时 {:?}",
+                self.surfaces.len(),
+                started.elapsed()
             );
         }
     }
@@ -1150,7 +1190,7 @@ impl Overlay {
 
     fn paint_and_commit(
         &self,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         key: &wl_surface::WlSurface,
         ctx: &mut SurfaceCtx,
     ) -> Result<()> {
@@ -1192,6 +1232,11 @@ impl Overlay {
         }
         ctx.last_drawn = ctx.selection;
 
+        if !self.locked {
+            // frame callback 在下一轮 dispatch 到达；它证明透明首帧已经被
+            // 合成器接收，满足抓取干净桌面的时序要求。
+            key.frame(qh, key.clone());
+        }
         buffer.attach_to(key).context("挂载 buffer 失败")?;
         key.set_buffer_scale(1);
         key.commit();
@@ -1217,31 +1262,43 @@ fn resize_rgba_bilinear(src: &[u8], src_size: (u32, u32), dst_size: (u32, u32)) 
         .checked_mul(dst_h as usize)
         .and_then(|n| n.checked_mul(4))
         .context("冻结画面目标尺寸溢出")?;
-    let mut dst = Vec::with_capacity(dst_len);
-
+    // 预计算坐标和 8-bit 权重，避免启动热路径中对每个像素重复做浮点运算。
+    // 1.25 倍缩放时，1920×1080 → 1536×864 约 130 万像素；使用整数定点
+    // 双线性插值可以把这段启动耗时从百毫秒级降到几十毫秒级。
+    let mut x_map = Vec::with_capacity(dst_w as usize);
+    for x in 0..dst_w {
+        let fx =
+            (((x as f64 + 0.5) * src_w as f64 / dst_w as f64) - 0.5).clamp(0.0, (src_w - 1) as f64);
+        let x0 = fx.floor() as u32;
+        let x1 = x0.saturating_add(1).min(src_w - 1);
+        let wx = ((fx - x0 as f64) * 256.0).round() as u16;
+        x_map.push((x0 as usize, x1 as usize, wx.min(256)));
+    }
+    let mut dst = vec![0u8; dst_len];
     for y in 0..dst_h {
         let fy =
             (((y as f64 + 0.5) * src_h as f64 / dst_h as f64) - 0.5).clamp(0.0, (src_h - 1) as f64);
-        let y0 = (fy.floor() as u32).min(src_h - 1);
+        let y0 = fy.floor() as u32;
         let y1 = y0.saturating_add(1).min(src_h - 1);
-        let wy = fy - y0 as f64;
-
-        for x in 0..dst_w {
-            let fx = (((x as f64 + 0.5) * src_w as f64 / dst_w as f64) - 0.5)
-                .clamp(0.0, (src_w - 1) as f64);
-            let x0 = (fx.floor() as u32).min(src_w - 1);
-            let x1 = x0.saturating_add(1).min(src_w - 1);
-            let wx = fx - x0 as f64;
-
-            let p00 = ((y0 * src_w + x0) * 4) as usize;
-            let p10 = ((y0 * src_w + x1) * 4) as usize;
-            let p01 = ((y1 * src_w + x0) * 4) as usize;
-            let p11 = ((y1 * src_w + x1) * 4) as usize;
+        let wy = (((fy - y0 as f64) * 256.0).round() as u16).min(256);
+        let inv_wy = 256 - wy;
+        let top_row = y0 as usize * src_w as usize;
+        let bottom_row = y1 as usize * src_w as usize;
+        let dst_row = y as usize * dst_w as usize * 4;
+        for (x, &(x0, x1, wx)) in x_map.iter().enumerate() {
+            let p00 = (top_row + x0) * 4;
+            let p10 = (top_row + x1) * 4;
+            let p01 = (bottom_row + x0) * 4;
+            let p11 = (bottom_row + x1) * 4;
+            let inv_wx = 256 - wx;
+            let out = dst_row + x * 4;
             for channel in 0..4 {
-                let top = src[p00 + channel] as f64 * (1.0 - wx) + src[p10 + channel] as f64 * wx;
-                let bottom =
-                    src[p01 + channel] as f64 * (1.0 - wx) + src[p11 + channel] as f64 * wx;
-                dst.push((top * (1.0 - wy) + bottom * wy).round() as u8);
+                let top = src[p00 + channel] as u32 * inv_wx as u32
+                    + src[p10 + channel] as u32 * wx as u32;
+                let bottom = src[p01 + channel] as u32 * inv_wx as u32
+                    + src[p11 + channel] as u32 * wx as u32;
+                dst[out + channel] =
+                    (((top * inv_wy as u32 + bottom * wy as u32) + 32768) >> 16) as u8;
             }
         }
     }
@@ -1580,7 +1637,17 @@ impl CompositorHandler for Overlay {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if let Some(ctx) = self.surfaces.get_mut(surface) {
+            ctx.presented = true;
+        }
+    }
 
     fn surface_enter(
         &mut self,
@@ -1644,6 +1711,7 @@ impl LayerShellHandler for Overlay {
                 ctx.pool = None;
                 ctx.background = None;
                 ctx.blurred_background = None;
+                ctx.presented = false;
                 if self.opts.verbose {
                     eprintln!("[verbose] layer surface configure {}x{}", w, h);
                 }
@@ -1697,6 +1765,7 @@ impl WindowHandler for Overlay {
                 ctx.pool = None;
                 ctx.background = None;
                 ctx.blurred_background = None;
+                ctx.presented = false;
                 if self.opts.verbose {
                     eprintln!("[verbose] xdg fullscreen configure {}x{}", w, h);
                 }
